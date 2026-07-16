@@ -1,0 +1,6 @@
+fr/esgi/kafka/sentinel/Topics.class
+fr/esgi/kafka/sentinel/SentinelApplication.class
+fr/esgi/kafka/sentinel/common/JsonSerdes.class
+fr/esgi/kafka/sentinel/model/Transaction.class
+fr/esgi/kafka/sentinel/model/Merchant.class
+fr/esgi/kafka/sentinel/SentinelTopology.class

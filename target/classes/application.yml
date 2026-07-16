@@ -1,0 +1,17 @@
+spring:
+  application:
+    name: sentinel
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:29092}
+    streams:
+      application-id: sentinel-${GROUPE:grp00}
+      properties:
+        default.key.serde: org.apache.kafka.common.serialization.Serdes$StringSerde
+        default.value.serde: org.apache.kafka.common.serialization.Serdes$StringSerde
+        auto.offset.reset: earliest
+        # Bonus fiabilite (SEN-6) :
+        # processing.guarantee: exactly_once_v2
+
+logging:
+  level:
+    fr.esgi.kafka: INFO

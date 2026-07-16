@@ -1,0 +1,8 @@
+* text=auto
+*.java text
+*.md text
+*.xml text
+*.yml text
+*.properties text
+*.sh text eol=lf
+*.ps1 text eol=crlf
