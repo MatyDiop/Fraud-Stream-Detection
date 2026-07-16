@@ -1,3 +1,7 @@
+server:
+  # 8080 occupe par un autre projet (Airflow) : l'API SEN-6 ecoute sur 8090.
+  port: 8090
+
 spring:
   application:
     name: sentinel
@@ -9,8 +13,8 @@ spring:
         default.key.serde: org.apache.kafka.common.serialization.Serdes$StringSerde
         default.value.serde: org.apache.kafka.common.serialization.Serdes$StringSerde
         auto.offset.reset: earliest
-        # Bonus fiabilite (SEN-6) :
-        # processing.guarantee: exactly_once_v2
+        # Bonus fiabilite (SEN-6) : exactly-once end-to-end via transactions Kafka.
+        processing.guarantee: exactly_once_v2
 
 logging:
   level:

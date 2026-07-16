@@ -7,6 +7,10 @@ import fr.esgi.kafka.sentinel.model.AmountState;
 import fr.esgi.kafka.sentinel.model.DlqEntry;
 import fr.esgi.kafka.sentinel.model.GeoAlert;
 import fr.esgi.kafka.sentinel.model.GeoState;
+import fr.esgi.kafka.sentinel.model.Merchant;
+import fr.esgi.kafka.sentinel.model.MerchantStats;
+import fr.esgi.kafka.sentinel.model.MerchantStatsOut;
+import fr.esgi.kafka.sentinel.model.MerchantWindowStats;
 import fr.esgi.kafka.sentinel.model.Transaction;
 import fr.esgi.kafka.sentinel.model.VelocityAlert;
 import fr.esgi.kafka.sentinel.processor.TxDeduplicator;
@@ -19,6 +23,7 @@ import org.apache.kafka.streams.KeyValue;
 import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.kstream.Branched;
 import org.apache.kafka.streams.kstream.Consumed;
+import org.apache.kafka.streams.kstream.GlobalKTable;
 import org.apache.kafka.streams.kstream.Grouped;
 import org.apache.kafka.streams.kstream.KStream;
 import org.apache.kafka.streams.kstream.Materialized;
@@ -30,8 +35,6 @@ import org.apache.kafka.streams.state.KeyValueStore;
 import org.apache.kafka.streams.state.StoreBuilder;
 import org.apache.kafka.streams.state.Stores;
 import org.apache.kafka.streams.state.WindowStore;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.kafka.annotation.EnableKafkaStreams;
@@ -52,7 +55,8 @@ import java.util.concurrent.TimeUnit;
 @EnableKafkaStreams
 public class SentinelTopology {
 
-    private static final Logger LOG = LoggerFactory.getLogger(SentinelTopology.class);
+    /** State store des compteurs d'alertes par type, lu par l'API /alerts/summary. */
+    public static final String ALERT_COUNTS_STORE = "sen6-alert-counts";
 
     @Bean
     public KStream<String, String> pipeline(StreamsBuilder builder) {
@@ -102,7 +106,7 @@ public class SentinelTopology {
                 () -> new TxDeduplicator("sen2-seen-tx", Duration.ofMinutes(10)),
                 "sen2-seen-tx");
 
-        dedupedTx
+        KStream<String, String> velocityAlerts = dedupedTx
                 .mapValues(Transaction::txId)
                 .groupByKey(Grouped.with(Serdes.String(), Serdes.String()))
                 .windowedBy(TimeWindows.ofSizeAndGrace(
@@ -120,8 +124,8 @@ public class SentinelTopology {
                     Instant end = Instant.ofEpochMilli(windowedKey.window().end());
                     return KeyValue.pair(cardId, JsonSerdes.toJson(
                             VelocityAlert.of(cardId, count, start, end)));
-                })
-                .to(Topics.ALERTS_VELOCITY, Produced.with(Serdes.String(), Serdes.String()));
+                });
+        velocityAlerts.to(Topics.ALERTS_VELOCITY, Produced.with(Serdes.String(), Serdes.String()));
 
 
         // -----------------------------------------------------------------
@@ -136,7 +140,7 @@ public class SentinelTopology {
         Serde<GeoState> geoStateSerde = JsonSerdes.of(GeoState.class);
         long tenMinutesMs = TimeUnit.MINUTES.toMillis(10);
 
-        validTx
+        KStream<String, String> geoAlerts = validTx
                 .groupByKey(Grouped.with(Serdes.String(), txSerde))
                 .aggregate(
                         GeoState::empty,
@@ -169,8 +173,8 @@ public class SentinelTopology {
                                 .withCachingDisabled())
                 .toStream()
                 .filter((cardId, state) -> state != null && state.alert() != null)
-                .mapValues(state -> JsonSerdes.toJson(state.alert()))
-                .to(Topics.ALERTS_GEO, Produced.with(Serdes.String(), Serdes.String()));
+                .mapValues(state -> JsonSerdes.toJson(state.alert()));
+        geoAlerts.to(Topics.ALERTS_GEO, Produced.with(Serdes.String(), Serdes.String()));
 
         // -----------------------------------------------------------------
         // SEN-4 - Montant anormal (> 10x la moyenne mobile)  -> Topics.ALERTS_AMOUNT
@@ -181,7 +185,7 @@ public class SentinelTopology {
         // -----------------------------------------------------------------
         Serde<AmountState> amountStateSerde = JsonSerdes.of(AmountState.class);
 
-        validTx
+        KStream<String, String> amountAlerts = validTx
                 .groupByKey(Grouped.with(Serdes.String(), txSerde))
                 .aggregate(
                         AmountState::empty,
@@ -205,12 +209,75 @@ public class SentinelTopology {
                                 .withCachingDisabled())
                 .toStream()
                 .filter((cardId, state) -> state != null && state.alert() != null)
-                .mapValues(state -> JsonSerdes.toJson(state.alert()))
-                .to(Topics.ALERTS_AMOUNT, Produced.with(Serdes.String(), Serdes.String()));
+                .mapValues(state -> JsonSerdes.toJson(state.alert()));
+        amountAlerts.to(Topics.ALERTS_AMOUNT, Produced.with(Serdes.String(), Serdes.String()));
 
-        // SEN-5 - Stats marchands (tumbling 5 min, join sentinel.merchants,
-        //         flag si taux DECLINED > 40 %)         -> Topics.MERCHANT_STATS
-        // SEN-6 (bonus) - exactly_once_v2 + API REST /alerts/summary (cf. README)
+        // -----------------------------------------------------------------
+        // SEN-5 - Stats marchands (tumbling 5 min)           -> Topics.MERCHANT_STATS
+        //   Repartition : la cle du flux est card_id, on regroupe par
+        //   merchant_id -> groupBy cree un topic de repartition (visible dans
+        //   topology.describe()). Enrichissement via GlobalKTable (repliquee,
+        //   pas de repartition pour la jointure) en leftJoin (un marchand hors
+        //   referentiel ne doit pas faire perdre ses stats). suspect si le
+        //   taux DECLINED depasse 40 %.
+        // -----------------------------------------------------------------
+        GlobalKTable<String, Merchant> merchants = builder.globalTable(
+                Topics.MERCHANTS,
+                Consumed.with(Serdes.String(), JsonSerdes.of(Merchant.class)));
+
+        Serde<MerchantStats> merchantStatsSerde = JsonSerdes.of(MerchantStats.class);
+
+        KStream<String, MerchantStatsOut> merchantStats = validTx
+                .groupBy((cardId, tx) -> tx.merchantId(),
+                        Grouped.with(Serdes.String(), txSerde))
+                .windowedBy(TimeWindows.ofSizeAndGrace(
+                        Duration.ofMinutes(5), Duration.ofMinutes(2)))
+                .aggregate(
+                        MerchantStats::empty,
+                        (merchantId, tx, stats) -> stats.add(
+                                tx.amount(), "DECLINED".equals(tx.status())),
+                        Materialized.<String, MerchantStats, WindowStore<Bytes, byte[]>>as(
+                                        "sen5-merchant-stats")
+                                .withKeySerde(Serdes.String())
+                                .withValueSerde(merchantStatsSerde))
+                .suppress(Suppressed.untilWindowCloses(Suppressed.BufferConfig.unbounded()))
+                .toStream()
+                .map((windowedKey, stats) -> KeyValue.pair(
+                        windowedKey.key(),
+                        new MerchantWindowStats(
+                                windowedKey.key(),
+                                stats.volume(),
+                                stats.totalAmount(),
+                                stats.declinedCount(),
+                                Instant.ofEpochMilli(windowedKey.window().start()).toString(),
+                                Instant.ofEpochMilli(windowedKey.window().end()).toString())))
+                .leftJoin(merchants,
+                        (merchantId, stats) -> merchantId,
+                        MerchantStatsOut::from);
+        merchantStats
+                .mapValues(JsonSerdes::toJson)
+                .to(Topics.MERCHANT_STATS, Produced.with(Serdes.String(), Serdes.String()));
+
+        // -----------------------------------------------------------------
+        // SEN-6 (bonus) - exactly_once_v2 + API REST /alerts/summary
+        //   EOS active dans application.yml (processing.guarantee).
+        //   Ici : on compte les alertes par type dans un state store
+        //   (sen6-alert-counts) interrogeable en Interactive Queries par
+        //   AlertsSummaryController (GET /alerts/summary).
+        // -----------------------------------------------------------------
+        KStream<String, String> merchantOutageTypes = merchantStats
+                .filter((merchantId, out) -> out.suspect())
+                .map((merchantId, out) -> KeyValue.pair(out.type(), ""));
+
+        velocityAlerts.map((k, v) -> KeyValue.pair("velocity_attack", ""))
+                .merge(geoAlerts.map((k, v) -> KeyValue.pair("impossible_travel", "")))
+                .merge(amountAlerts.map((k, v) -> KeyValue.pair("big_ticket", "")))
+                .merge(merchantOutageTypes)
+                .groupByKey(Grouped.with(Serdes.String(), Serdes.String()))
+                .count(Materialized.<String, Long, KeyValueStore<Bytes, byte[]>>as(
+                                ALERT_COUNTS_STORE)
+                        .withKeySerde(Serdes.String())
+                        .withValueSerde(Serdes.Long()));
 
         return rawTx;
     }
