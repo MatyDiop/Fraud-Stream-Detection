@@ -1,231 +1,232 @@
-# Projet SENTINEL — Détection de fraude paiements
+# SENTINEL — Détection de fraude paiements en temps réel
 
-*Framework imposé : **Spring Boot 4.1 + Kafka Streams***
+Pipeline **Spring Boot 4 + Kafka Streams** (Java 21) qui consomme un flux de
+transactions carte (~10 tx/s, ~7 % de messages cassés, retards, doublons),
+écarte proprement les invalides, et produit quatre familles d'alertes fraude.
 
-## Contexte
+> Sujet complet : [SUJET.md](SUJET.md). Backlog SEN-1 à SEN-6 : tous implémentés.
 
-Vous rejoignez l'équipe Risk de **SENTINEL**, un processeur de paiements
-(pensez Stripe). ~10 transactions carte par seconde arrivent de toute
-l'Europe et de New York. L'équipe fraude veut quatre détections en temps
-réel : la **velocity** (une carte qui mitraille), le **voyage impossible**
-(Paris puis New York en 4 minutes), le **montant anormal** (20× le panier
-habituel de la carte), et le monitoring **marchands** (un terminal qui refuse
-65 % des paiements est soit en panne, soit compromis).
+## Démarrage rapide
 
-Les terminaux de paiement vieillissants envoient des messages cassés : champs
-manquants, `"lon": "douze"`, JSON tronqué, doublons, retardataires. **Le flux
-ne sera jamais propre : c'est à votre pipeline d'être robuste.** Et ici, un
-crash de pipeline = des fraudes qui passent.
+### Prérequis
 
-## Mission
+JDK 21+, Maven 3.9+, Docker. Pour le rejeu local : Python 3 + le dossier
+`generateurs-v3/` fourni par l'enseignant (hors dépôt, cf. `.gitignore`),
+installé une fois via `./scripts/setup-generateurs.sh`.
 
-Construire une application **Spring Boot + Kafka Streams** qui consomme le
-flux de transactions, écarte proprement les messages invalides, et produit
-les quatre familles d'alertes du backlog.
+### En local (cluster Docker + jeu de données figé)
+
+```bash
+# 1. Cluster local (3 brokers KRaft + Kafbat UI sur :8081) + topics
+#    + injection des 114 538 transactions du jeu figé — idempotent.
+./scripts/dev-up.sh
+
+# 2. L'application
+GROUPE=grp00 KAFKA_BOOTSTRAP=localhost:29092 mvn spring-boot:run
+```
+
+Vérifier : Kafbat UI sur <http://localhost:8081> (topics `grp00.sentinel.*`),
+API sur <http://localhost:8090/alerts/summary>.
+
+### Sur le cluster partagé (évaluation)
+
+```bash
+GROUPE=<votre-groupe> KAFKA_BOOTSTRAP=<serveur>:9092 mvn spring-boot:run
+```
+
+`GROUPE` préfixe les 5 topics de sortie et l'`application.id`
+(`sentinel-<groupe>`) — câblé dans `Topics.java`. Les topics d'entrée
+(`sentinel.transactions`, `sentinel.merchants`) sont consommés en lecture
+seule, jamais écrits.
+
+### Tests
+
+```bash
+mvn test        # 8 tests TopologyTestDriver, sans broker
+```
+
+Chaque test reprend un critère écrit du sujet : montant négatif → DLQ motivée,
+poison pill sans crash, aucun valide perdu, 5 tx/min → une alerte velocity,
+doublon de `tx_id` non compté, Paris→NYC en 4 min → `impossible_travel`,
+Paris→Bruxelles en 2 h → silence, retardataire → pas de fausse alerte géo.
 
 ## Architecture
 
 ```
-sentinel.transactions ──> [ VALIDATION ] ──> invalides ──> <grp>.sentinel.dlq
-                               │
-                               ▼ valides
-      ┌────────────────┬───────┴────────┬────────────────┬──────────────────┐
-      ▼                ▼                ▼                ▼                  
-  velocity        voyage           montant          stats marchands        
-  (≥5 tx/min)     impossible       anormal          (tumbling 5 min        
-      │           (>500 km         (>10× moyenne     + join merchants,     
-      │            <10 min)         mobile carte)     flag DECLINED>40%)   
-      ▼                ▼                ▼                ▼                  
-<grp>.sentinel.  <grp>.sentinel.  <grp>.sentinel.  <grp>.sentinel.         
-alerts.velocity  alerts.geo       alerts.amount    merchant.stats          
-                                                        ▲
-                                          sentinel.merchants (GlobalKTable)
+sentinel.transactions ──► VALIDATION (JsonNode, champ par champ)
+                              │
+              invalides ──────┴──────► <grp>.sentinel.dlq  {reason, raw}
+                              │ valides (KStream<card_id, Transaction>)
+        ┌─────────────┬───────┴───────┬────────────────┐
+        ▼             ▼               ▼                ▼
+   SEN-2 velocity  SEN-3 geo     SEN-4 amount    SEN-5 merchants
+   dédup tx_id     aggregate     aggregate       groupBy(merchant_id)
+   tumbling 1min   {position     {somme,compte}  = REPARTITION
+   + grace 2min    précédente}   comparer AVANT  tumbling 5min
+   count ≥ 5       haversine     d'incorporer    + leftJoin GlobalKTable
+   + suppress      >500km ET     ratio > 10×     (sentinel.merchants)
+        │          <10min             │          taux DECLINED > 40 %
+        ▼             ▼               ▼                ▼
+   alerts.velocity alerts.geo   alerts.amount   merchant.stats
+        └─────────────┴───────┬───────┴────────────────┘
+                              ▼
+               SEN-6 : count par type (state store)
+               ──► GET /alerts/summary (Interactive Queries)
 ```
 
-## Topics et formats
+Exactly-once (`processing.guarantee=exactly_once_v2`) actif sur toute la
+topologie : lecture + mise à jour des state stores + écriture des alertes
+sont atomiques.
 
-### Entrées (fournies — ne jamais écrire dedans)
+## Formats de sortie (JSON)
 
-**`sentinel.transactions`** — clé : `card_id` — `currency` ∈ `EUR | USD | GBP`,
-`status` ∈ `APPROVED | DECLINED` (94 % APPROVED en régime normal) :
+### `<grp>.sentinel.dlq` — clé : celle du message d'origine
+
+Tout message invalide, avec le brut intact (rejouable) et une raison lisible.
+21 raisons distinctes observées sur le jeu figé (7 597 rejets / 114 538).
 
 ```json
-{
-  "tx_id": "tx-864e9a13",
-  "card_id": "card-0353",
-  "merchant_id": "mch-014",
-  "merchant_name": "Bistrot 21 7",
-  "category": "RESTAURANT",
-  "amount": 23.44,
-  "currency": "EUR",
-  "city": "Paris",
-  "lat": 48.8566,
-  "lon": 2.3522,
-  "status": "APPROVED",
-  "timestamp": "2026-07-04T14:03:21.512Z"
-}
+{"reason": "amount <= 0", "raw": "{\"tx_id\": \"tx-...\", \"amount\": -12.5, ...}"}
 ```
 
-Villes possibles : Paris, Lyon, Marseille, Bordeaux, Lille, Berlin, Madrid,
-Milan, London, New York, Amsterdam, Bruxelles. Catégories : `RESTAURANT,
-SUPERMARCHE, ESSENCE, ELECTRONIQUE, VOYAGE, MODE, VTC, STREAMING`.
+Raisons émises : `JSON illisible`, `champ requis manquant: <champ>`,
+`amount: type invalide`, `amount <= 0`, `currency inconnue: <val>`,
+`status inconnu: <val>`, `lat/lon: type invalide`, `lat hors bornes`,
+`lon hors bornes`, `timestamp non ISO-8601`.
 
-**`sentinel.merchants`** — topic **compacté**, clé : `merchant_id` :
+### `<grp>.sentinel.alerts.velocity` — clé : `card_id`
+
+Une alerte par (carte, fenêtre d'1 min) dont le compte dédoublonné atteint 5.
 
 ```json
-{
-  "merchant_id": "mch-014",
-  "name": "Bistrot 21 7",
-  "category": "RESTAURANT",
-  "city": "Paris"
-}
+{"type": "velocity_attack", "card_id": "card-0405", "count": 5,
+ "window_start": "2026-07-15T22:55:00Z", "window_end": "2026-07-15T22:56:00Z"}
 ```
 
-### Anomalies présentes dans le flux (~7 % + retards + doublons)
+### `<grp>.sentinel.alerts.geo` — clé : `card_id`
 
-| Anomalie                               | Exemple                  | Impact si non gérée                       |
-|----------------------------------------|--------------------------|-------------------------------------------|
-| Champ requis absent                    | pas de `card_id`         | tx inexploitable                          |
-| Champ à `null`                         | `"amount": null`         | NullPointerException                      |
-| Mauvais type                           | `"lon": "douze"`         | crash de désérialisation                  |
-| Valeur hors bornes                     | `amount: -12.5`          | moyennes polluées                         |
-| Enum inconnue                          | `"status": "APPROVEDD"`  | stats marchands fausses                   |
-| Timestamp illisible                    | `"hier a 15h"`           | fenêtrage cassé                           |
-| JSON tronqué / non-JSON / message vide | `{"tx_id": "tx`          | **poison pill : l'appli meurt en boucle** |
-| Événement en retard                    | timestamp − 30 à 180 min | velocity faussée                          |
-| Doublon exact                          | même `tx_id` deux fois   | fausse velocity                           |
+Deux transactions de la même carte à plus de 500 km d'écart en moins de
+10 min (haversine, timestamps embarqués).
 
-### Sorties (à produire, préfixées par votre groupe)
-
-`<grp>.sentinel.dlq` · `<grp>.sentinel.alerts.velocity` ·
-`<grp>.sentinel.alerts.geo` · `<grp>.sentinel.alerts.amount` ·
-`<grp>.sentinel.merchant.stats` — constantes prêtes dans `Topics.java`.
-Format des valeurs libre **mais en JSON documenté dans votre README de rendu**.
-
-## Backlog
-
-> La base 8/20 = SEN-1 fonctionnel de bout en bout sur le cluster partagé.
-> Chaque ticket suivant est un bonus **crédité uniquement s'il est défendu à
-> l'oral** (vous devrez le modifier en direct).
-
-**SEN-1 — Ingestion fiable (socle, obligatoire)**
-Consommer `sentinel.transactions`, parser, valider (champs requis, types,
-`amount > 0`, enums `currency`/`status`, `-90 ≤ lat ≤ 90`, `-180 ≤ lon ≤ 180`,
-timestamp ISO-8601 parsable). Invalides → DLQ **avec message original +
-raison**. L'application ne doit **jamais** crasher.
-*Critères : 10 min sans crash ; DLQ motivée ; aucun message valide perdu.*
-
-**SEN-2 — Velocity** → `<grp>.sentinel.alerts.velocity`
-Alerte quand une `card_id` fait **≥ 5 transactions par minute** (tumbling
-1 min). Le générateur attaque une carte toutes les ~5 min (6 tx en ~45 s).
-*Critères : chaque `velocity_attack` est détectée ; un doublon de `tx_id` ne
-gonfle pas le compte (dédoublonnage à justifier) ; silence en régime normal.*
-
-**SEN-3 — Voyage impossible** → `<grp>.sentinel.alerts.geo`
-Alerte quand deux transactions **de la même carte** sont distantes de
-**plus de 500 km en moins de 10 minutes**. C'est le ticket difficile : il faut
-mémoriser la dernière position de chaque carte (state store / `aggregate` qui
-transporte `{lat, lon, timestamp}` précédents) et comparer à chaque nouvelle
-transaction. Distance : formule de haversine
-(`d = 2R·asin(√(sin²(Δφ/2) + cosφ₁·cosφ₂·sin²(Δλ/2)))`, R = 6371 km) — une
-approximation plane est refusée. Le générateur simule Paris → New York en
-~4 min toutes les ~6 min.
-*Critères : chaque `impossible_travel` est détecté avec les deux villes et la
-distance ; Paris → Bruxelles en 2 h ne déclenche rien.*
-
-**SEN-4 — Montant anormal** → `<grp>.sentinel.alerts.amount`
-Alerte quand `amount` dépasse **10× la moyenne mobile** des montants de la
-carte (moyenne entretenue dans un agrégat `{somme, compte}` par `card_id` ;
-ignorer les cartes avec moins de 5 transactions d'historique). Le générateur
-injecte un montant ~20× toutes les ~4 min.
-*Critères : chaque `big_ticket` est détecté avec le ratio ; l'alerte elle-même
-ne doit pas polluer la moyenne (réfléchissez à l'ordre des opérations).*
-
-**SEN-5 — Stats marchands** → `<grp>.sentinel.merchant.stats`
-Par `merchant_id` sur **fenêtres tumbling de 5 min** : volume, montant total,
-taux de `DECLINED`. Enrichir avec `name`/`category`/`city` via **GlobalKTable**
-sur `sentinel.merchants`. Flag `suspect: true` si le taux de DECLINED dépasse
-**40 %**. Le générateur met un marchand en panne toutes les ~8 min
-(~65 % DECLINED pendant 90 s).
-*Critères : chaque `merchant_outage` ressort flaggée ; stats enrichies ;
-attention au repartitionnement (la clé d'entrée est `card_id`).*
-
-**SEN-6 (bonus) — Exactly-once + API**
-Activer `processing.guarantee=exactly_once_v2` (préparé en commentaire dans
-`application.yml`) et exposer `GET /alerts/summary` (compteurs d'alertes par
-type — ajoutez le starter web de Spring Boot et lisez vos state stores via
-`StreamsBuilderFactoryBean`). Expliquer à l'oral ce qu'EOS change et coûte.
-*Critères : endpoint qui répond avec des compteurs cohérents ; explication
-correcte du mécanisme transactionnel.*
-
-## Démarrage rapide
-
-Prérequis : JDK 21, Maven 3.9+, Docker.
-
-```bash
-# 1. Cluster local pour développer (3 brokers KRaft + Kafbat UI sur :8080)
-docker compose up -d
-
-# 2. Lancer l'application
-GROUPE=grp07 KAFKA_BOOTSTRAP=localhost:29092 mvn spring-boot:run
+```json
+{"type": "impossible_travel", "card_id": "card-0115",
+ "from_city": "Paris", "to_city": "New York",
+ "distance_km": 5837.2, "minutes": 4.0,
+ "from_ts": "2026-07-15T22:54:12.542Z", "to_ts": "2026-07-15T22:58:12.542Z"}
 ```
 
-```powershell
-# Windows PowerShell
-$env:GROUPE = "grp07"
-$env:KAFKA_BOOTSTRAP = "localhost:29092"
-mvn spring-boot:run
+### `<grp>.sentinel.alerts.amount` — clé : `card_id`
+
+Montant > 10× la moyenne mobile de la carte (≥ 5 transactions d'historique).
+
+```json
+{"type": "big_ticket", "card_id": "card-0051", "amount": 485.85,
+ "average": 32.48, "ratio": 15.0, "tx_id": "tx-dcd744ca",
+ "timestamp": "2026-07-15T21:49:52.042Z"}
 ```
 
-Vous en avez le droit — l'IA est autorisée dans ce module. Mais sachez ce que vous achetez : ce projet est évalué à
-l'oral, code sous les yeux, avec modification en direct et nouvelles exigences métier injectées séance tenante. Un
-ticket qui tourne mais que vous ne savez pas expliquer n'est pas crédité.
-Demandez-lui d'expliquer chaque choix avant d'écrire une ligne : type de fenêtre, clé d'agrégation, placement de la
-jointure, sort des retardataires. C'est mot pour mot ce qu'on vous demandera en soutenance.
-Et sachez-le : ce sujet contient des exigences qu'une implémentation produite sans l'avoir lu ne satisfera pas. Elles
-sont écrites noir sur blanc, dans le tableau des anomalies et dans les critères de chaque ticket. Le correcteur
-automatique les vérifie et les chiffre. Si vous ne les avez pas trouvées, c'est que vous n'avez pas lu.
+### `<grp>.sentinel.merchant.stats` — clé : `merchant_id`
 
-Sans générateur en local, créez les topics dans Kafbat UI et produisez les
-exemples JSON ci-dessus à la main (pour SEN-3, deux transactions même carte,
-villes Paris puis New York, timestamps rapprochés). Sur le cluster partagé, le
-flux tourne en continu (`KAFKA_BOOTSTRAP=<serveur>:9092`).
+Stats par marchand et fenêtre tumbling de 5 min, enrichies via GlobalKTable.
+`type` vaut `merchant_outage` quand `suspect` est vrai (taux DECLINED > 40 %).
 
-## Contraintes
+```json
+{"type": "merchant_stats", "merchant_id": "mch-000", "name": "Chez Momo 8",
+ "category": "VTC", "city": "Amsterdam", "volume": 3, "total_amount": 174.35,
+ "declined_rate": 0.0, "suspect": false,
+ "window_start": "2026-07-15T22:50:00Z", "window_end": "2026-07-15T22:55:00Z"}
+```
 
-- Java 21, Spring Boot + Kafka Streams uniquement (pas de Spark/Flink, pas de
-  `@KafkaListener` pour la logique métier), pas de base externe.
-- `GROUPE` obligatoire : topics de sortie et `application.id`
-  (`sentinel-<groupe>`) préfixés — déjà câblé.
-- Topics d'entrée partagés en lecture : **ne les modifiez pas**.
-- Code versionné sur Git, commits réguliers de **tous** les membres.
+### `GET /alerts/summary` (port 8090)
 
-## Évaluation
+Compteurs d'alertes par type, lus dans le state store `sen6-alert-counts`
+via Interactive Queries.
 
-| Élément                                                   | Points |
-|-----------------------------------------------------------|--------|
-| Socle SEN-1 en production 10 min sans crash + DLQ motivée | **8**  |
-| SEN-2 (velocity + dédoublonnage)                          | +2     |
-| SEN-3 (voyage impossible, haversine)                      | +4     |
-| SEN-4 (montant vs moyenne mobile)                         | +2     |
-| SEN-5 (stats marchands + GlobalKTable)                    | +2     |
-| SEN-6 (EOS + API) ou tests TopologyTestDriver sérieux     | +2     |
+```json
+{"velocity_attack": 606, "impossible_travel": 62039, "big_ticket": 117, "merchant_outage": 27}
+```
 
-Plafond 20. **Un ticket non expliqué à l'oral = non crédité.** Attendez-vous à
-une demande de modification en direct (« Product Owner twist »).
+## Choix de conception (par ticket)
 
-## Conseils
+**SEN-1.** Parse en `JsonNode` puis validation champ par champ — jamais de
+mapping direct vers `Transaction` (coercions Jackson silencieuses : un
+`"amount": "23.44"` en *string* passerait) et jamais d'exception (poison
+pill). On valide exactement la liste du sujet, rien de plus : rejeter une
+ville ou catégorie inconnue perdrait des messages valides.
 
-- Le `LOG.info` fourni sert au premier contact : supprimez-le ensuite.
-- Poison pill dès le premier jour : `JsonSerdes.parseOrNull` évite le crash,
-  la validation métier vous appartient.
-- SEN-3 : `aggregate` dont l'accumulateur contient la transaction précédente
-  ET l'alerte éventuelle, puis `filter` + `mapValues` — pas besoin de
-  Processor API (mais elle est acceptée si maîtrisée).
-- SEN-4 : mettez la transaction courante dans la moyenne APRÈS l'avoir
-  comparée, sinon l'anomalie se camoufle elle-même.
-- Le flux est clé par `card_id` : SEN-2/3/4 n'ont pas besoin de
-  repartitionnement, SEN-5 si (`groupBy(merchant_id)`) — sachez le montrer
-  dans `topology.describe()`.
-- `split()`/`branch()` — l'ancienne API `branch(Predicate...)` a disparu en
-  Kafka 4.0.
+**SEN-2.** Clé déjà `card_id` → `groupByKey` sans repartition. Dédoublonnage
+des `tx_id` **avant** le comptage (state store + purge par ponctuation
+STREAM_TIME, rétention 10 min — le jeu contient 2 065 doublons).
+Fenêtre tumbling 1 min, **grace 2 min** : les retardataires de 30-180 min
+sont valides mais ne rouvrent pas une fenêtre de vélocité ancienne (WARN
+`Skipping record for expired window` = comportement voulu).
+`suppress(untilWindowCloses)` : une seule alerte finale par fenêtre.
+
+**SEN-3.** `aggregate` par carte transportant `{lat, lon, city, ts}`
+précédents + l'alerte éventuelle. Distance de **haversine** (R = 6371 km,
+l'approximation plane est refusée). Condition **ET** : > 500 km ET < 10 min
+sur les **timestamps embarqués**. Retardataire (Δt < 0) : ni comparaison ni
+écrasement de la position récente → pas de fausse alerte.
+`withCachingDisabled()` pour qu'aucun état porteur d'alerte ne soit écrasé
+avant émission.
+
+**SEN-4.** `aggregate {somme, compte}` par carte. **Comparer avant
+d'incorporer** : un montant 20× incorporé d'abord gonflerait sa propre
+moyenne et se camouflerait. Cartes avec < 5 transactions ignorées.
+
+**SEN-5.** `groupBy(merchant_id)` alors que la clé du flux est `card_id` →
+**topic de repartition** créé (visible dans `topology.describe()`).
+Enrichissement en **`leftJoin`** sur **GlobalKTable** (table répliquée, pas
+de repartition pour la jointure ; un marchand hors référentiel ne perd pas
+ses stats). Jointure faite au niveau du flux de stats, conformément à
+« la jointure avant l'agrégat » pour la clé de regroupement (ici la clé
+`merchant_id` est portée par l'événement lui-même).
+
+**SEN-6.** `exactly_once_v2` : commits transactionnels (latence et débit en
+retrait contre la garantie « chaque alerte exactement une fois » — vérifié :
+`read_committed` = `read_uncommitted` sur toutes les sorties). API REST par
+Interactive Queries sur le store `sen6-alert-counts` (503 tant que le stream
+n'est pas RUNNING).
+
+## Limites connues et assumées
+
+- **SEN-3 est volumineux (~62 000 alertes sur le jeu figé)** : le générateur
+  tire une ville aléatoire par transaction, donc 61,5 % des paires
+  consécutives dépassent déjà 500 km / 10 min. La règle littérale du sujet
+  est implémentée telle quelle ; en production réelle on ajouterait un modèle
+  de localisation habituelle par carte. En attente du détail des seuils
+  (`PROJETS-VUE-ENSEMBLE.md`) pour recalibrer si nécessaire.
+- **SEN-5 flagge des marchands à très faible volume** (2 tx dont 1 refusée =
+  50 % > 40 %). Règle littérale conservée ; un seuil de significativité
+  (volume ≥ 10, parallèle du « ≥ 5 tx » de SEN-4) l'éliminerait.
+- Les montants aberrants mais positifs (`1e9`) passent SEN-1 (la règle est
+  `amount > 0`, sans borne haute — ne pas sur-valider) et ressortent en
+  SEN-4 avec un ratio astronomique : comportement cohérent inter-tickets.
+
+## Structure du code
+
+```
+src/main/java/fr/esgi/kafka/sentinel/
+├── SentinelTopology.java        # toute la topologie, un bloc par ticket
+├── Topics.java                  # noms des topics (fourni, non modifié)
+├── api/AlertsSummaryController  # SEN-6 : GET /alerts/summary
+├── common/Geo.java              # haversine
+├── common/JsonSerdes.java       # serdes JSON (fourni)
+├── model/                       # records : Transaction, Merchant (fournis),
+│                                #   DlqEntry, VelocityAlert, GeoAlert/State,
+│                                #   AmountAlert/State, MerchantStats*/Out
+├── processor/TxDeduplicator     # dédoublonnage tx_id (state store + purge)
+└── validation/                  # TransactionValidator, ValidationResult
+```
+
+## Scripts
+
+| Script | Rôle |
+|---|---|
+| `scripts/setup-generateurs.sh` | Install ponctuelle de l'outil de rejeu (venv + librdkafka) |
+| `scripts/dev-up.sh` | Cluster local + topics + injection du jeu figé (idempotent) |
+
+Rejeu manuel (depuis `generateurs-v3/`, venv activé) :
+`python rejouer.py --dossier data/sentinel --bootstrap localhost:29092`
+(`--speed 60` pour un rejeu en temps quasi réel, `--create-topics --project
+sentinel --replication-factor 1` après un `docker compose down`).

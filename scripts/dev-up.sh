@@ -55,3 +55,5 @@ python rejouer.py --dossier data/sentinel --project sentinel \
 echo ""
 echo "==> Pret. Kafbat UI : http://localhost:8081"
 echo "==> Lancer l'appli  : GROUPE=grp00 KAFKA_BOOTSTRAP=$BOOTSTRAP mvn spring-boot:run"
+echo "    (si le JDK par defaut est < 21 : prefixer avec JAVA_HOME=/opt/homebrew/opt/openjdk)"
+echo "==> API SEN-6       : http://localhost:8090/alerts/summary"
