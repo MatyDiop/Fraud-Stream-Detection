@@ -29,6 +29,19 @@ for i in $(seq 1 30); do
   sleep 2
 done
 
+echo "==> Nettoyage des topics existants (evite le doublement des donnees)"
+# Sans ca, relancer dev-up.sh sans 'docker compose down' ferait rejouer
+# par-dessus les donnees deja presentes (chaque message compterait 2x).
+# On supprime les topics d'entree + toutes les sorties/etats du groupe.
+for topic in sentinel.transactions sentinel.merchants \
+    $(docker exec kafka-1 /opt/kafka/bin/kafka-topics.sh \
+        --bootstrap-server localhost:9092 --list 2>/dev/null \
+        | grep -E "^grp00\.|^sentinel-grp00-"); do
+  docker exec kafka-1 /opt/kafka/bin/kafka-topics.sh \
+      --bootstrap-server localhost:9092 --delete --topic "$topic" >/dev/null 2>&1 || true
+done
+sleep 2
+
 echo "==> 2/3 + 3/3 Creation des topics et injection du jeu de donnees SENTINEL"
 cd "$GEN_DIR"
 if [ ! -d ".venv" ]; then
