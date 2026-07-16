@@ -1,0 +1,15 @@
+# Build Maven
+target/
+
+# Générateur du prof : outil + données fournies séparément, pas du code source
+# du projet. Volumineux (~420 Mo pour les 9 sujets) : à récupérer à côté,
+# jamais à committer.
+generateurs-v3/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+*.iml
+.vscode/
