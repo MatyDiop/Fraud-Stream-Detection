@@ -101,3 +101,14 @@ public final class TransactionValidator {
         return ValidationResult.valid(transaction);
     }
 }
+
+
+
+
+
+
+
+
+/*c'est le fichier qui valide les transactions, si ces transaction passent tous les filtres elle est valide et
+ * on continue la pipeline, sinon elle est invalide et on la met dans la DLQ avec la raison de l'invalidité 
+*/
