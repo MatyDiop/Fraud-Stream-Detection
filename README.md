@@ -16,6 +16,10 @@ installé une fois via `./scripts/setup-generateurs.sh`.
 
 ### En local (cluster Docker + jeu de données figé)
 
+> `grp00` est une valeur de **test local uniquement** (câblée dans
+> `./scripts/dev-up.sh`). Ce n'est **pas** le vrai groupe — ne jamais
+> l'utiliser sur le cluster partagé (cf. section suivante).
+
 ```bash
 # 1. Cluster local (3 brokers KRaft + Kafbat UI sur :8081) + topics
 #    + injection des 114 538 transactions du jeu figé — idempotent.
@@ -28,11 +32,16 @@ GROUPE=grp00 KAFKA_BOOTSTRAP=localhost:29092 mvn spring-boot:run
 Vérifier : Kafbat UI sur <http://localhost:8081> (topics `grp00.sentinel.*`),
 API sur <http://localhost:8090/alerts/summary>.
 
-### Sur le cluster partagé (évaluation)
+### Sur le cluster partagé (évaluation) — GROUPE = grp07
 
 ```bash
-GROUPE=<votre-groupe> KAFKA_BOOTSTRAP=<serveur>:9092 mvn spring-boot:run
+GROUPE=grp07 KAFKA_BOOTSTRAP=<serveur-du-prof>:9092 mvn spring-boot:run
 ```
+
+Sorties produites sous `grp07.sentinel.*` (DLQ, alertes, stats marchands).
+Ne jamais oublier `GROUPE` ici : sans lui, `Topics.java` retombe sur le
+défaut `grp00` (valeur de test) et le correcteur ne trouverait aucune sortie
+sous le bon groupe.
 
 `GROUPE` préfixe les 5 topics de sortie et l'`application.id`
 (`sentinel-<groupe>`) — câblé dans `Topics.java`. Les topics d'entrée
