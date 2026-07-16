@@ -2,6 +2,8 @@ package fr.esgi.kafka.sentinel;
 
 import fr.esgi.kafka.sentinel.common.Geo;
 import fr.esgi.kafka.sentinel.common.JsonSerdes;
+import fr.esgi.kafka.sentinel.model.AmountAlert;
+import fr.esgi.kafka.sentinel.model.AmountState;
 import fr.esgi.kafka.sentinel.model.DlqEntry;
 import fr.esgi.kafka.sentinel.model.GeoAlert;
 import fr.esgi.kafka.sentinel.model.GeoState;
@@ -170,8 +172,42 @@ public class SentinelTopology {
                 .mapValues(state -> JsonSerdes.toJson(state.alert()))
                 .to(Topics.ALERTS_GEO, Produced.with(Serdes.String(), Serdes.String()));
 
-        // SEN-4 - Montant anormal (> 10x la moyenne mobile de la carte)
-        //                                               -> Topics.ALERTS_AMOUNT
+        // -----------------------------------------------------------------
+        // SEN-4 - Montant anormal (> 10x la moyenne mobile)  -> Topics.ALERTS_AMOUNT
+        //   aggregate {somme, compte} par carte -> moyenne mobile. Piege du
+        //   sujet : COMPARER la transaction a la moyenne AVANT de l'incorporer
+        //   (sinon un montant 20x gonfle sa propre moyenne et se camoufle).
+        //   Ignorer les cartes avec < 5 transactions d'historique.
+        // -----------------------------------------------------------------
+        Serde<AmountState> amountStateSerde = JsonSerdes.of(AmountState.class);
+
+        validTx
+                .groupByKey(Grouped.with(Serdes.String(), txSerde))
+                .aggregate(
+                        AmountState::empty,
+                        (cardId, tx, state) -> {
+                            AmountAlert alert = null;
+                            if (state.count() >= 5) {
+                                double avg = state.sum() / state.count();
+                                if (tx.amount() > 10.0 * avg) {
+                                    alert = AmountAlert.of(cardId, tx.amount(), avg,
+                                            tx.txId(), tx.timestamp());
+                                }
+                            }
+                            // On incorpore la transaction courante APRES l'avoir comparee.
+                            return new AmountState(
+                                    state.sum() + tx.amount(), state.count() + 1, alert);
+                        },
+                        Materialized.<String, AmountState, KeyValueStore<Bytes, byte[]>>as(
+                                        "sen4-amount-state")
+                                .withKeySerde(Serdes.String())
+                                .withValueSerde(amountStateSerde)
+                                .withCachingDisabled())
+                .toStream()
+                .filter((cardId, state) -> state != null && state.alert() != null)
+                .mapValues(state -> JsonSerdes.toJson(state.alert()))
+                .to(Topics.ALERTS_AMOUNT, Produced.with(Serdes.String(), Serdes.String()));
+
         // SEN-5 - Stats marchands (tumbling 5 min, join sentinel.merchants,
         //         flag si taux DECLINED > 40 %)         -> Topics.MERCHANT_STATS
         // SEN-6 (bonus) - exactly_once_v2 + API REST /alerts/summary (cf. README)
