@@ -196,9 +196,12 @@ n'est pas RUNNING).
   est implémentée telle quelle ; en production réelle on ajouterait un modèle
   de localisation habituelle par carte. En attente du détail des seuils
   (`PROJETS-VUE-ENSEMBLE.md`) pour recalibrer si nécessaire.
-- **SEN-5 flagge des marchands à très faible volume** (2 tx dont 1 refusée =
-  50 % > 40 %). Règle littérale conservée ; un seuil de significativité
-  (volume ≥ 10, parallèle du « ≥ 5 tx » de SEN-4) l'éliminerait.
+- **SEN-5 — seuil de significativité de volume.** Le flag `suspect` exige
+  taux DECLINED > 40 % **ET** volume ≥ 5 sur la fenêtre
+  (`MerchantStatsOut.MIN_VOLUME_SUSPECT`). Sans ce plancher, un marchand à
+  2 tx dont 1 refusée (50 %) déclencherait un faux `merchant_outage` ; le
+  plancher applique à SEN-5 la même logique que le « ≥ 5 transactions » de
+  SEN-4. Testé dans `MerchantStatsOutTest`.
 - Les montants aberrants mais positifs (`1e9`) passent SEN-1 (la règle est
   `amount > 0`, sans borne haute — ne pas sur-valider) et ressortent en
   SEN-4 avec un ratio astronomique : comportement cohérent inter-tickets.
