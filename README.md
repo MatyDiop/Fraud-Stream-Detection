@@ -52,7 +52,7 @@ GROUPE=grp07 KAFKA_BOOTSTRAP=<serveur-du-prof>:9092 mvn spring-boot:run
 Sorties produites sous `grp07.sentinel.*` (DLQ, alertes, stats marchands).
 Ne jamais oublier `GROUPE` ici : sans lui, `Topics.java` retombe sur le
 défaut `grp00` (valeur de test) et le correcteur ne trouverait aucune sortie
-sous le bon groupe.
+sous le bon groupe
 
 `GROUPE` préfixe les 5 topics de sortie et l'`application.id`
 (`sentinel-<groupe>`) — câblé dans `Topics.java`. Les topics d'entrée
