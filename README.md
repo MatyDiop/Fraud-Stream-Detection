@@ -275,3 +275,27 @@ Le corriger vers un JDK ≥ 21 installé, ou rouvrir un terminal si le profil a
 Manque de mémoire Docker (ex. Airflow/autres conteneurs tournent en parallèle).
 → Libérer de la mémoire (arrêter les conteneurs inutilisés) avant de relancer
 `./scripts/dev-up.sh`. Non pertinent sur le cluster dédié du prof.
+
+**L'application démarre (`Started SentinelApplication`) mais ne produit
+rien : `Processed 0 total records` en boucle dans les logs, alors que le
+lag de consommation semble à 0.** Cause : un run précédent sous le même
+`GROUPE` a été interrompu brutalement (kill, crash, `Ctrl+C` sur un process
+zombie) **avant son premier commit**, laissant les topics internes
+(changelogs, topics de repartition `sentinel-<groupe>-*-repartition`/
+`*-changelog`) dans un état incohérent. Relancer le JVM ne suffit pas : ces
+topics vivent **sur le cluster**, pas dans le process. Deux façons de
+corriger, **sans jamais toucher au cluster partagé dans son ensemble** :
+
+```bash
+# Option A (propre) : reset officiel Kafka Streams pour CE SEUL application-id
+kafka-streams-application-reset --application-id sentinel-<groupe> \
+    --bootstrap-server <serveur>:9092 --input-topics sentinel.transactions
+
+# Option B (en local uniquement) : tout recreer
+docker compose down && ./scripts/dev-up.sh
+```
+
+→ **Leçon pour la soutenance** : si l'application semble bloquée juste après
+un premier lancement raté (Ctrl+C trop rapide, erreur de config), ne pas
+la relancer bêtement en boucle sous le même `GROUPE` — nettoyer d'abord
+(option A) pour éviter de rester bloqué une seconde fois.
