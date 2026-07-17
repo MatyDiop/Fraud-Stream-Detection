@@ -73,7 +73,7 @@ public class SentinelTopology {
         //   message original + raison. Jamais d'exception -> jamais de crash.
         // -----------------------------------------------------------------
         KStream<String, ValidationResult> validated = rawTx
-                .mapValues(TransactionValidator::validate);
+                .mapValues(TransactionValidator::validate); // (key, value) -> valide aussi cle == card_id
 
         Map<String, KStream<String, ValidationResult>> branches = validated
                 .split(Named.as("sen1-"))
@@ -213,7 +213,7 @@ public class SentinelTopology {
         amountAlerts.to(Topics.ALERTS_AMOUNT, Produced.with(Serdes.String(), Serdes.String()));
 
         // -----------------------------------------------------------------
-        // SEN-5 - Stats marchands (tumbling 5 min)  -> Topics.MERCHANT_STATS
+        // SEN-5 - Stats marchands (tumbling 5 min)           -> Topics.MERCHANT_STATS
         //   Repartition : la cle du flux est card_id, on regroupe par
         //   merchant_id -> groupBy cree un topic de repartition (visible dans
         //   topology.describe()). Enrichissement via GlobalKTable (repliquee,

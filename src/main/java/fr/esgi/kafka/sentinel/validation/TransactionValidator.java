@@ -27,7 +27,14 @@ public final class TransactionValidator {
     private TransactionValidator() {
     }
 
-    public static ValidationResult validate(String raw) {
+    /**
+     * @param key cle Kafka du record (attendue = card_id ; toute la pipeline
+     *            aval - SEN-2/3/4 - regroupe par cle sans repartition sur
+     *            cette hypothese. Une divergence serait un bug silencieux :
+     *            les agregats par carte seraient calcules sur le mauvais
+     *            regroupement, sans aucune exception pour le signaler).
+     */
+    public static ValidationResult validate(String key, String raw) {
         JsonNode node;
         try {
             node = MAPPER.readTree(raw);
@@ -43,6 +50,14 @@ public final class TransactionValidator {
             if (value == null || value.isNull()) {
                 return ValidationResult.invalid(raw, "champ requis manquant: " + field);
             }
+        }
+
+        String cardId = node.get("card_id").asText();
+        if (key == null) {
+            return ValidationResult.invalid(raw, "cle Kafka absente (attendu card_id)");
+        }
+        if (!key.equals(cardId)) {
+            return ValidationResult.invalid(raw, "cle Kafka != card_id");
         }
 
         JsonNode amountNode = node.get("amount");
@@ -87,7 +102,7 @@ public final class TransactionValidator {
 
         Transaction transaction = new Transaction(
                 node.get("tx_id").asText(),
-                node.get("card_id").asText(),
+                cardId,
                 node.get("merchant_id").asText(),
                 node.get("merchant_name").asText(),
                 node.get("category").asText(),

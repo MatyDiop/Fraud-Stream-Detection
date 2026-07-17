@@ -1,6 +1,10 @@
 # Build Maven
 target/
 
+# Outil du prof (generateur + jeu de donnees ~43 Mo) : necessaire en local
+# pour les tests, mais pas du code du projet - le prof a deja le sien.
+generateurs-v3/
+
 # macOS
 .DS_Store
 
