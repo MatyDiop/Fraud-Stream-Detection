@@ -20,17 +20,28 @@ installé une fois via `./scripts/setup-generateurs.sh`.
 > `./scripts/dev-up.sh`). Ce n'est **pas** le vrai groupe — ne jamais
 > l'utiliser sur le cluster partagé (cf. section suivante).
 
+**L'ordre est obligatoire.** L'étape 1 crée les topics d'entrée
+(`sentinel.transactions`, `sentinel.merchants`) et y injecte les données.
+Sans elle, l'application démarre puis **plante immédiatement** au chargement
+de la GlobalKTable (voir [Dépannage](#dépannage)).
+
 ```bash
-# 1. Cluster local (3 brokers KRaft + Kafbat UI sur :8081) + topics
-#    + injection des 114 538 transactions du jeu figé — idempotent.
+# 1. D'ABORD : cluster local (3 brokers KRaft + Kafbat UI sur :8081)
+#    + création des topics d'entrée + injection des 114 538 transactions
+#    du jeu figé. Idempotent (relançable sans doublonner). Attendre "Pret".
 ./scripts/dev-up.sh
 
-# 2. L'application
+# 2. ENSUITE, dans le même terminal : l'application
 GROUPE=grp00 KAFKA_BOOTSTRAP=localhost:29092 mvn spring-boot:run
 ```
 
+Prérequis Java : le terminal doit utiliser un **JDK ≥ 21** (`java -version`).
+Sinon, préfixer par `JAVA_HOME=/opt/homebrew/opt/openjdk@21` (macOS Homebrew).
+
 Vérifier : Kafbat UI sur <http://localhost:8081> (topics `grp00.sentinel.*`),
 API sur <http://localhost:8090/alerts/summary>.
+
+Pour tout arrêter : `Ctrl+C` sur l'application, puis `docker compose down`.
 
 ### Sur le cluster partagé (évaluation) — GROUPE = grp07
 
@@ -239,3 +250,28 @@ Rejeu manuel (depuis `generateurs-v3/`, venv activé) :
 `python rejouer.py --dossier data/sentinel --bootstrap localhost:29092`
 (`--speed 60` pour un rejeu en temps quasi réel, `--create-topics --project
 sentinel --replication-factor 1` après un `docker compose down`).
+
+## Dépannage
+
+**`There are no partitions available for topic sentinel.merchants`**
+(au démarrage, `BUILD FAILURE`, exit 1). Le topic d'entrée n'existe pas :
+l'application a été lancée **sans** avoir fait `./scripts/dev-up.sh` avant,
+ou le cluster a été recréé (`docker compose down`/redémarrage) sans réinjecter.
+→ En local : (re)lancer `./scripts/dev-up.sh` puis l'application. Sur le
+cluster partagé, ce topic est fourni en continu par le générateur du prof :
+l'erreur n'y arrive pas.
+
+**`UnsupportedClassVersionError ... class file version 65.0 ... up to 61.0`**
+Le terminal utilise un JDK trop vieux (61 = Java 17) pour du code compilé en
+Java 21 (65). → Vérifier `java -version` (doit être ≥ 21) ; sinon préfixer par
+`JAVA_HOME=/opt/homebrew/opt/openjdk@21`.
+
+**`The JAVA_HOME environment variable is not defined correctly`**
+`JAVA_HOME` pointe vers un dossier qui n'existe plus (ancien JDK supprimé). →
+Le corriger vers un JDK ≥ 21 installé, ou rouvrir un terminal si le profil a
+été mis à jour.
+
+**Les brokers Kafka crashent (`Exited 1`) en local sous forte charge.**
+Manque de mémoire Docker (ex. Airflow/autres conteneurs tournent en parallèle).
+→ Libérer de la mémoire (arrêter les conteneurs inutilisés) avant de relancer
+`./scripts/dev-up.sh`. Non pertinent sur le cluster dédié du prof.

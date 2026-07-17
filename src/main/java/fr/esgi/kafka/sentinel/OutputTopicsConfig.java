@@ -15,19 +15,19 @@ import org.springframework.kafka.config.TopicBuilder;
  * premiere ecriture d'une alerte echouerait faute de topic.
  *
  * <p>Partitions alignees sur le topic d'entree {@code sentinel.transactions}
- * (6). Facteur de replication a 1 pour rester valable sur n'importe quel
- * cluster (un seul broker suffit) ; a monter si le cluster cible l'impose.
+ * (6). Le facteur de replication n'est PAS fixe : Kafka applique le defaut
+ * du broker (1 en local mono-usage, 3 sur un cluster de production). Fixer
+ * RF=1 en dur serait dangereux en production : avec min.insync.replicas=2,
+ * les ecritures acks=all (exigees par exactly-once) echoueraient toutes.
  */
 @Configuration
 public class OutputTopicsConfig {
 
     private static final int PARTITIONS = 6;
-    private static final short REPLICATION = 1;
 
     private static NewTopic topic(String name) {
         return TopicBuilder.name(name)
                 .partitions(PARTITIONS)
-                .replicas(REPLICATION)
                 .build();
     }
 
